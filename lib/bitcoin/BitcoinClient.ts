@@ -6,7 +6,7 @@ import BitcoinTransactionModel from './models/BitcoinTransactionModel';
 import IBitcoinClient from './interfaces/IBitcoinClient';
 import nodeFetch, { FetchError, Response, RequestInit } from 'node-fetch';
 import ReadableStream from '../common/ReadableStream';
-import { Address, Networks, PrivateKey, Script, Transaction } from 'bitcore-lib';
+import { Address, Networks, PrivateKey, Script, Transaction, crypto } from 'bitcore-lib';
 import { IBlockInfo } from './BitcoinProcessor';
 
 /**
@@ -81,7 +81,14 @@ export default class BitcoinClient implements IBitcoinClient {
     const transaction = await this.createBitcoreTransaction(transactionData, feeInSatoshis);
     const rawTransaction = transaction.serialize();
 
-    console.info(`Broadcasting transaction ${transaction.id}`);
+    // console.info(`Broadcasting transaction ${transaction.id}`);
+    const unspentCoins = await this.getUnspentOutputs(this.privateKeyAddress);
+    const currentHeight = await this.getCurrentBlockHeight();
+    const lockUntilHeight = currentHeight + 5;
+    const [freezeTxn, spendTxn] = this.buildFreezeAndSpendTransactions(unspentCoins, lockUntilHeight, 10000);
+
+    await this.decodeAndPrint(freezeTxn);
+    await this.decodeAndPrint(spendTxn);
 
     const request = {
       method: 'sendrawtransaction',
@@ -89,8 +96,73 @@ export default class BitcoinClient implements IBitcoinClient {
         rawTransaction
       ]
     };
+    console.info(request);
 
-    return this.rpcCall(request, true);
+    // return this.rpcCall(request, true);
+    return transaction.hash;
+  }
+
+  private buildFreezeAndSpendTransactions (
+    unspentCoins: Transaction.UnspentOutput[],
+    lockUntilblock: number,
+    freezeAmountInSatoshis: number): [Transaction, Transaction] {
+
+    const lockBuffer = (crypto.BN as any).fromNumber(lockUntilblock).toScriptNumBuffer();
+    const publicKeyHashOut = Script.buildPublicKeyHashOut(this.privateKeyAddress);
+
+    const redeemScript = Script.empty()
+                         .add(lockBuffer)
+                         .add(177) // CLTV
+                         .add(117) // DROP
+                         .add(publicKeyHashOut);
+
+    const payToScriptHash = Script.buildScriptHashOut(redeemScript);
+    const payToScriptAddress = new Address(payToScriptHash);
+
+    const freezeTransaction = new Transaction()
+                              .from(unspentCoins)
+                              .to(payToScriptAddress, freezeAmountInSatoshis)
+                              .fee(1000)
+                              .change(this.privateKeyAddress)
+                              .sign(this.privateKey);
+
+    const frozenOutputAsUnspentOutput = Transaction.UnspentOutput.fromObject({
+      txid: freezeTransaction.id,
+      vout: 0,
+      scriptPubKey: (redeemScript as any).toScriptHashOut(),
+      satoshis: freezeAmountInSatoshis
+    });
+
+    const unfreezeFee = 1000;
+    const spendTransaction = new Transaction()
+                             .from([frozenOutputAsUnspentOutput]) // .concat(unspentCoins))
+                             .to(this.privateKeyAddress, freezeAmountInSatoshis - unfreezeFee)
+                             .fee(unfreezeFee)
+                             // .change(this.privateKeyAddress)
+                             .lockUntilBlockHeight(lockUntilblock + 1);
+
+    const signature = (Transaction as any).sighash.sign(spendTransaction, this.privateKey, 0x1, 0, redeemScript);
+
+    const inputScript = Script.empty()
+                        .add(signature.toTxFormat())
+                        .add(this.privateKey.toPublicKey().toBuffer())
+                        .add(redeemScript.toBuffer());
+
+    (spendTransaction.inputs[0] as any).setScript(inputScript);
+
+    return [freezeTransaction, spendTransaction];
+  }
+
+  private async decodeAndPrint (transaction: Transaction): Promise<void> {
+    const request = {
+      method: 'decoderawtransaction',
+      params: [
+        (transaction.serialize as any)(true)
+      ]
+    };
+
+    const response = await this.rpcCall(request, true);
+    console.debug(JSON.stringify(response));
   }
 
   public async getBlock (hash: string): Promise<BitcoinBlockModel> {
