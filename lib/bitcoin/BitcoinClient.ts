@@ -84,8 +84,8 @@ export default class BitcoinClient implements IBitcoinClient {
     // console.info(`Broadcasting transaction ${transaction.id}`);
     const unspentCoins = await this.getUnspentOutputs(this.privateKeyAddress);
     const currentHeight = await this.getCurrentBlockHeight();
-    const lockUntilHeight = currentHeight + 5;
-    const [freezeTxn, spendTxn] = this.buildFreezeAndSpendTransactions(unspentCoins, lockUntilHeight, 10000);
+    const lockUntilHeight = currentHeight + 2;
+    const [freezeTxn, spendTxn] = await this.buildFreezeAndSpendTransactions(unspentCoins, lockUntilHeight, 10000);
 
     await this.decodeAndPrint(freezeTxn);
     await this.decodeAndPrint(spendTxn);
@@ -102,22 +102,20 @@ export default class BitcoinClient implements IBitcoinClient {
     return transaction.hash;
   }
 
-  private buildFreezeAndSpendTransactions (
+  private async buildFreezeAndSpendTransactions (
     unspentCoins: Transaction.UnspentOutput[],
     lockUntilblock: number,
-    freezeAmountInSatoshis: number): [Transaction, Transaction] {
+    freezeAmountInSatoshis: number): Promise<[Transaction, Transaction]> {
 
-    const lockBuffer = (crypto.BN as any).fromNumber(lockUntilblock).toScriptNumBuffer();
-    const publicKeyHashOut = Script.buildPublicKeyHashOut(this.privateKeyAddress);
+    console.info(`********** Starting balance: ${await this.getBalanceInSatoshis()}`);
+    console.info(`Lock until: ${lockUntilblock}`);
 
-    const redeemScript = Script.empty()
-                         .add(lockBuffer)
-                         .add(177) // CLTV
-                         .add(117) // DROP
-                         .add(publicKeyHashOut);
+    const redeemScript = this.buildRedeemScript(lockUntilblock);
+    const redeemScriptHash = Script.buildScriptHashOut(redeemScript);
+    const payToScriptAddress = new Address(redeemScriptHash);
 
-    const payToScriptHash = Script.buildScriptHashOut(redeemScript);
-    const payToScriptAddress = new Address(payToScriptHash);
+    // console.info(`########### PublicKeyHashOut: ${publicKeyHashOut}`);
+    // console.info(`########### PayToScriptHash: ${payToScriptHash}`);
 
     const freezeTransaction = new Transaction()
                               .from(unspentCoins)
@@ -126,20 +124,29 @@ export default class BitcoinClient implements IBitcoinClient {
                               .change(this.privateKeyAddress)
                               .sign(this.privateKey);
 
+    await this.broadcastRpc(freezeTransaction.serialize());
+    console.info(`********** Balance right after broadcast: ${await this.getBalanceInSatoshis()}`);
+
+    while (lockUntilblock - 1 > await this.getCurrentBlockHeight()) {
+      await this.waitFor(60000);
+    }
+
     const frozenOutputAsUnspentOutput = Transaction.UnspentOutput.fromObject({
       txid: freezeTransaction.id,
       vout: 0,
-      scriptPubKey: (redeemScript as any).toScriptHashOut(),
+      scriptPubKey: redeemScriptHash,
       satoshis: freezeAmountInSatoshis
     });
 
+    // unspentCoins = await this.getUnspentOutputs(this.privateKeyAddress);
+    console.info(`********** New Balance: ${await this.getBalanceInSatoshis()}`);
     const unfreezeFee = 1000;
     const spendTransaction = new Transaction()
                              .from([frozenOutputAsUnspentOutput]) // .concat(unspentCoins))
                              .to(this.privateKeyAddress, freezeAmountInSatoshis - unfreezeFee)
                              .fee(unfreezeFee)
                              // .change(this.privateKeyAddress)
-                             .lockUntilBlockHeight(lockUntilblock + 1);
+                             .lockUntilBlockHeight(lockUntilblock);
 
     const signature = (Transaction as any).sighash.sign(spendTransaction, this.privateKey, 0x1, 0, redeemScript);
 
@@ -149,6 +156,8 @@ export default class BitcoinClient implements IBitcoinClient {
                         .add(redeemScript.toBuffer());
 
     (spendTransaction.inputs[0] as any).setScript(inputScript);
+
+    await this.broadcastRpc((spendTransaction.serialize as any)(true));
 
     return [freezeTransaction, spendTransaction];
   }
@@ -161,10 +170,37 @@ export default class BitcoinClient implements IBitcoinClient {
       ]
     };
 
-    const response = await this.rpcCall(request, true);
-    console.debug(JSON.stringify(response));
+    // const response = await this.rpcCall(request, true);
+    // console.debug(JSON.stringify(response));
+    await this.rpcCall(request, true);
   }
 
+  private async broadcastRpc (txnAsString: string): Promise<string> {
+    const request = {
+      method: 'sendrawtransaction',
+      params: [
+        txnAsString
+      ]
+    };
+
+    const id = await this.rpcCall(request, true);
+    console.info(`Broadcasted transaction: ${id}`);
+
+    return id;
+  }
+
+  private buildRedeemScript(lockUntilblock: number): Script {
+    const lockBuffer = (crypto.BN as any).fromNumber(lockUntilblock).toScriptNumBuffer();
+    const publicKeyHashOut = Script.buildPublicKeyHashOut(this.privateKeyAddress);
+
+    const redeemScript = Script.empty()
+                         .add(lockBuffer)
+                         .add(177) // CLTV
+                         .add(117) // DROP
+                         .add(publicKeyHashOut);
+
+    return redeemScript;
+  }
   public async getBlock (hash: string): Promise<BitcoinBlockModel> {
     const request = {
       method: 'getblock',
