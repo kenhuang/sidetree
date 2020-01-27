@@ -6,7 +6,7 @@ import BitcoinTransactionModel from './models/BitcoinTransactionModel';
 import IBitcoinClient from './interfaces/IBitcoinClient';
 import nodeFetch, { FetchError, Response, RequestInit } from 'node-fetch';
 import ReadableStream from '../common/ReadableStream';
-import { Address, Networks, PrivateKey, Script, Transaction, crypto } from 'bitcore-lib';
+import { Address, Networks, PrivateKey, Script, Transaction, crypto, PublicKey, HDPrivateKey } from 'bitcore-lib';
 import { IBlockInfo } from './BitcoinProcessor';
 
 /**
@@ -84,6 +84,8 @@ export default class BitcoinClient implements IBitcoinClient {
     // console.info(`Broadcasting transaction ${transaction.id}`);
     let finalLockUntilBlock = await this.getCurrentBlockHeight();
 
+    this.testing();
+
     console.info(`********** Starting balance: ${await this.getBalanceInSatoshis()}`);
     const unspentCoins = await this.getUnspentOutputs(this.privateKeyAddress);
     const currentHeight = await this.getCurrentBlockHeight();
@@ -91,26 +93,33 @@ export default class BitcoinClient implements IBitcoinClient {
     const freezeAmountInSatoshis = 10000;
 
     const freezeTransaction = this.buildFreezeTransaction(unspentCoins, lockUntilHeight, freezeAmountInSatoshis);
+    console.info('*************FREEZE Transaction');
+    await this.decodeAndPrint(freezeTransaction.serialize());
 
-    await this.broadcastRpc(freezeTransaction.serialize());
+    // await this.broadcastRpc(freezeTransaction.serialize());
 
-    while (lockUntilHeight > await this.getCurrentBlockHeight()) {
-      await this.waitFor(60000);
-    }
+    // while (lockUntilHeight > await this.getCurrentBlockHeight()) {
+    //   await this.waitFor(60000);
+    // }
 
     console.info(`********** Balance 2: ${await this.getBalanceInSatoshis()}`);
     finalLockUntilBlock = lockUntilHeight + 3;
     const spendToFreezeTransaction = this.buildSpendToFreezeTransaction(freezeTransaction, lockUntilHeight, finalLockUntilBlock);
+    console.info('*************FREEZE 2 FREEZE Transaction');
+    await this.decodeAndPrint((spendToFreezeTransaction.serialize as any)(true));
 
-    await this.broadcastRpc((spendToFreezeTransaction.serialize as any)(true));
+    // await this.broadcastRpc((spendToFreezeTransaction.serialize as any)(true));
 
-    while (finalLockUntilBlock > await this.getCurrentBlockHeight()) {
-      await this.waitFor(60000);
-    }
+    // while (finalLockUntilBlock > await this.getCurrentBlockHeight()) {
+    //   await this.waitFor(60000);
+    // }
 
     console.info(`********** Balance 3: ${await this.getBalanceInSatoshis()}`);
     const spendToWalletTransaction = this.buildSpendToWalletTransaction(spendToFreezeTransaction, finalLockUntilBlock);
-    await this.broadcastRpc((spendToWalletTransaction.serialize as any)(true));
+    console.info('*************FREEZE 2 WALLET Transaction');
+    await this.decodeAndPrint((spendToWalletTransaction.serialize as any)(true));
+
+    // await this.broadcastRpc((spendToWalletTransaction.serialize as any)(true));
     // const [freezeTxn, spendTxn] = await this.buildFreezeAndSpendTransactions(unspentCoins, lockUntilHeight, 10000);
 
     const request = {
@@ -123,6 +132,41 @@ export default class BitcoinClient implements IBitcoinClient {
 
     // return this.rpcCall(request, true);
     return transaction.hash;
+  }
+
+  private testing (): void {
+    this.tryExecute(() => {
+      const scriptAsHex = '03096319b17576a91489605b86b7ad185ebc10fe457b98776838972cf088ac';
+      const script = new Script(Buffer.from(scriptAsHex, 'hex'));
+      console.info(script.toASM());
+    });
+
+    const publicKeyAsHex = '02b40336640f23c0a8511a92bcde1b620f393cce722feaf6be16b009f447bbf0a2';
+
+    this.tryExecute(() => {
+      const publicKey = new PublicKey(publicKeyAsHex);
+      const publicKeyAddress = (publicKey as any).toAddress('testnet');
+      const publicKeyHashOut = Script.buildPublicKeyHashOut(publicKeyAddress);
+      console.info(publicKeyHashOut);
+    });
+
+    this.tryExecute(() => {
+      const publicKeyHd = new HDPrivateKey(Buffer.from(publicKeyAsHex, 'hex'));
+      console.info(publicKeyHd.toString());
+    });
+
+    this.tryExecute(() => {
+      const publicKeyHd2 = new HDPrivateKey(publicKeyAsHex);
+      console.info(publicKeyHd2.toString());
+    });
+  }
+
+  private tryExecute (expression: () => any): void {
+    try {
+      expression();
+    } catch (e) {
+      console.info(`***Exception during execution: ${JSON.stringify(e, Object.getOwnPropertyNames(e))}`);
+    }
   }
 
   private buildFreezeTransaction (
@@ -247,21 +291,33 @@ export default class BitcoinClient implements IBitcoinClient {
     return spendTransaction;
   }
 
-  private async broadcastRpc (txnAsString: string): Promise<string> {
+  private async decodeAndPrint (serializedTxn: string): Promise<void> {
     const request = {
-      method: 'sendrawtransaction',
+      method: 'decoderawtransaction',
       params: [
-        txnAsString
+        serializedTxn
       ]
     };
 
-    const id = await this.rpcCall(request, true);
-    console.info(`Broadcasted transaction: ${id}`);
-
-    return id;
-
-    // return Promise.resolve('123');
+    const response = await this.rpcCall(request, true);
+    console.debug(JSON.stringify(response));
   }
+
+  // private async broadcastRpc (txnAsString: string): Promise<string> {
+  //   const request = {
+  //     method: 'sendrawtransaction',
+  //     params: [
+  //       txnAsString
+  //     ]
+  //   };
+
+  //   const id = await this.rpcCall(request, true);
+  //   console.info(`Broadcasted transaction: ${id}`);
+
+  //   return id;
+
+  //   // return Promise.resolve('123');
+  // }
 
   private buildRedeemScript (lockUntilblock: number): Script {
     const lockBuffer = (crypto.BN as any).fromNumber(lockUntilblock).toScriptNumBuffer();
